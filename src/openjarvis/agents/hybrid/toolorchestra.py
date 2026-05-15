@@ -43,6 +43,10 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import shutil
+import tempfile
+from pathlib import Path
+
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.hybrid._base import (
     ANTHROPIC_WEB_SEARCH_TOOL,
@@ -52,6 +56,11 @@ from openjarvis.agents.hybrid._base import (
 from openjarvis.agents.hybrid._prices import (
     is_gpt5_family,
     supports_temperature,
+)
+from openjarvis.agents.hybrid.mini_swe_agent import (
+    _clone_repo,
+    _extract_diff,
+    run_swe_agent_loop,
 )
 from openjarvis.core.registry import AgentRegistry
 
@@ -263,6 +272,52 @@ def _call_worker(
     raise ValueError(f"unsupported worker type: {wtype!r}")
 
 
+def _swe_call_worker(
+    worker: Dict[str, Any],
+    prompt: str,
+    cfg: Dict[str, Any],
+    task: Dict[str, Any],
+    workdir: Path,
+    turn: int,
+) -> Tuple[str, int, int, bool, float, int]:
+    """SWE-bench worker dispatch: route solver workers through
+    run_swe_agent_loop on a shared workdir. Web-search workers fall back
+    to the regular one-shot dispatch (search isn't an agent loop)."""
+    wtype = worker.get("type", "openai")
+    if wtype == "anthropic-web-search":
+        # Search workers stay one-shot.
+        return _call_worker(worker, prompt, cfg)
+    if wtype == "vllm":
+        backbone = "local"
+        endpoint = worker.get("base_url")
+    elif wtype == "anthropic":
+        backbone = "cloud"
+        endpoint = None
+    else:
+        # OpenAI workers fall back to one-shot.
+        return _call_worker(worker, prompt, cfg)
+    out = run_swe_agent_loop(
+        task,
+        backbone=backbone,
+        backbone_model=worker["model"],
+        cloud_endpoint="anthropic",
+        local_endpoint=endpoint,
+        initial_prompt=prompt,
+        max_turns=int(cfg.get("swe_max_turns", 30)),
+        bash_timeout=int(cfg.get("swe_bash_timeout_s", 120)),
+        output_cap=int(cfg.get("swe_output_cap", 10_000)),
+        turn_max_tokens=int(cfg.get("swe_turn_max_tokens", 4096)),
+        trace_prefix=f"toolorch_turn{turn}",
+        workdir=workdir,
+    )
+    is_local = backbone == "local"
+    return (
+        out["final_summary"] or out["answer"],
+        out["tokens_in"], out["tokens_out"],
+        is_local, 0.0, 0,
+    )
+
+
 @AgentRegistry.register("toolorchestra")
 class ToolOrchestraAgent(LocalCloudAgent):
     """Prompted multi-turn dispatcher over a mixed worker pool.
@@ -289,6 +344,30 @@ class ToolOrchestraAgent(LocalCloudAgent):
 
         max_turns = int(cfg.get("max_turns", 6))
         orch_max_tokens = int(cfg.get("orchestrator_max_tokens", 1024))
+
+        task_meta = (context.metadata.get("task") if context is not None else {}) or {}
+        swe_mode = (
+            bool(cfg.get("swe_use_agent_loop"))
+            and bool(task_meta.get("problem_statement"))
+            and bool(task_meta.get("repo"))
+            and bool(task_meta.get("base_commit"))
+        )
+        shared_workdir: Optional[Path] = None
+        if swe_mode:
+            shared_workdir = Path(tempfile.mkdtemp(
+                prefix=f"toolorch-swe-{task_meta.get('task_id','x')}-"
+            ))
+            try:
+                _clone_repo(task_meta["repo"], task_meta["base_commit"], shared_workdir)
+            except Exception:
+                shutil.rmtree(shared_workdir, ignore_errors=True)
+                raise
+            self.record_trace_event({
+                "kind": "toolorchestra_swe_workdir",
+                "workdir": str(shared_workdir),
+                "repo": task_meta["repo"],
+                "base_commit": task_meta["base_commit"],
+            })
 
         history: List[Dict[str, Any]] = []
         tokens_local = 0
@@ -346,9 +425,17 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         break
                     continue
                 worker = workers[wid]
-                w_text, w_in, w_out, is_local, extra_cost, n_searches = _call_worker(
-                    worker, str(w_input), cfg
-                )
+                if swe_mode and shared_workdir is not None:
+                    w_text, w_in, w_out, is_local, extra_cost, n_searches = (
+                        _swe_call_worker(
+                            worker, str(w_input), cfg, task_meta,
+                            shared_workdir, turn,
+                        )
+                    )
+                else:
+                    w_text, w_in, w_out, is_local, extra_cost, n_searches = (
+                        _call_worker(worker, str(w_input), cfg)
+                    )
                 if is_local:
                     tokens_local += w_in + w_out
                 else:
@@ -372,9 +459,15 @@ class ToolOrchestraAgent(LocalCloudAgent):
         if final_answer is None:
             # Hard fallback: call the strongest worker (last) directly.
             worker = workers[-1]
-            ans, w_in, w_out, is_local, extra_cost, _ = _call_worker(
-                worker, question, cfg
-            )
+            if swe_mode and shared_workdir is not None:
+                ans, w_in, w_out, is_local, extra_cost, _ = _swe_call_worker(
+                    worker, question, cfg, task_meta,
+                    shared_workdir, max_turns + 1,
+                )
+            else:
+                ans, w_in, w_out, is_local, extra_cost, _ = _call_worker(
+                    worker, question, cfg
+                )
             if is_local:
                 tokens_local += w_in + w_out
             else:
@@ -392,6 +485,17 @@ class ToolOrchestraAgent(LocalCloudAgent):
                 "fallback": True,
             })
             final_answer = ans
+
+        # In SWE mode, the authoritative output is the working-tree diff —
+        # frame it (the runner extracts it via the scorer's ```diff fence).
+        if swe_mode and shared_workdir is not None:
+            patch = _extract_diff(shared_workdir)
+            if patch.strip():
+                final_answer = (
+                    f"{final_answer}\n\n```diff\n{patch}```"
+                    if final_answer else f"```diff\n{patch}```"
+                )
+            shutil.rmtree(shared_workdir, ignore_errors=True)
 
         meta = {
             "tokens_local": tokens_local,

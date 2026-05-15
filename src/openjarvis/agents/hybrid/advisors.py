@@ -27,8 +27,17 @@ import json
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
+import shutil
+import tempfile
+from pathlib import Path
+
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.hybrid._base import LocalCloudAgent
+from openjarvis.agents.hybrid.mini_swe_agent import (
+    _clone_repo,
+    _extract_diff,
+    run_swe_agent_loop,
+)
 from openjarvis.core.registry import AgentRegistry
 
 
@@ -96,6 +105,16 @@ class AdvisorsAgent(LocalCloudAgent):
     ) -> Tuple[str, Dict[str, Any]]:
         question = input
         cfg = self._cfg
+        task_meta = (context.metadata.get("task") if context is not None else {}) or {}
+        swe_mode = (
+            bool(cfg.get("swe_use_agent_loop"))
+            and bool(task_meta.get("problem_statement"))
+            and bool(task_meta.get("repo"))
+            and bool(task_meta.get("base_commit"))
+        )
+        if swe_mode:
+            return self._run_swe(question, task_meta, cfg)
+
         executor_max_tokens = int(cfg.get("executor_max_tokens", 4096))
         advisor_max_tokens = int(cfg.get("advisor_max_tokens", 1024))
         advisor_temperature = float(cfg.get("advisor_temperature", 0.2))
@@ -158,6 +177,111 @@ class AdvisorsAgent(LocalCloudAgent):
             },
         }
         return final_answer, meta
+
+    # ------------------------------------------------------------------
+    # SWE-bench variant: each executor pass is a full mini-SWE-agent run.
+    # ------------------------------------------------------------------
+
+    def _run_swe(
+        self,
+        question: str,
+        task: Dict[str, Any],
+        cfg: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        if not self._local_endpoint or not self._local_model:
+            raise ValueError(
+                "AdvisorsAgent (swe mode) still needs local_model + local_endpoint "
+                "for the advisor critique step."
+            )
+
+        # Each executor pass is its own mini-SWE-agent run with a FRESH
+        # workdir — the advisor doesn't get a workdir, just the patch text.
+        max_turns = int(cfg.get("swe_max_turns", 30))
+        bash_timeout = int(cfg.get("swe_bash_timeout_s", 120))
+        output_cap = int(cfg.get("swe_output_cap", 10_000))
+        turn_max_tokens = int(cfg.get("swe_turn_max_tokens", 4096))
+
+        # 1. Initial executor pass
+        initial_out = run_swe_agent_loop(
+            task,
+            backbone="cloud",
+            backbone_model=self._cloud_model,
+            cloud_endpoint=self._cloud_endpoint,
+            initial_prompt=question,
+            max_turns=max_turns,
+            bash_timeout=bash_timeout,
+            output_cap=output_cap,
+            turn_max_tokens=turn_max_tokens,
+            trace_prefix="advisors_executor1",
+        )
+
+        # 2. Advisor pass — local model critiques the produced patch
+        local_model = _resolve_local_model(self._local_endpoint, self._local_model)
+        advisor_prompt = ADVISOR_TEMPLATE.format(
+            question=question,
+            initial_response=(
+                f"Summary: {initial_out['final_summary']}\n\n"
+                f"Patch produced:\n```diff\n{initial_out['patch']}```"
+            ),
+        )
+        advisor_text, adv_in, adv_out = self._call_vllm(
+            local_model,
+            self._local_endpoint,
+            user=advisor_prompt,
+            max_tokens=int(cfg.get("advisor_max_tokens", 2048)),
+            temperature=float(cfg.get("advisor_temperature", 0.2)),
+            enable_thinking=False,
+        )
+
+        # 3. Final executor pass — FRESH workdir, advisor feedback folded
+        # into the initial prompt. (Don't reuse initial workdir — that
+        # would smuggle the bad-fix into the new attempt; we want the
+        # final pass to incorporate ONLY the parts of the advisor's
+        # feedback that hold up.)
+        final_prompt = (
+            f"{question}\n\n"
+            f"-----\n"
+            f"You previously attempted a fix. Your initial summary was:\n"
+            f"{initial_out['final_summary']}\n\n"
+            f"An advisor reviewed your attempt and wrote this feedback:\n"
+            f"{advisor_text}\n\n"
+            f"Incorporate the advisor's feedback where it improves correctness; "
+            f"ignore where it is wrong. Produce your best fix now."
+        )
+        final_out = run_swe_agent_loop(
+            task,
+            backbone="cloud",
+            backbone_model=self._cloud_model,
+            cloud_endpoint=self._cloud_endpoint,
+            initial_prompt=final_prompt,
+            max_turns=max_turns,
+            bash_timeout=bash_timeout,
+            output_cap=output_cap,
+            turn_max_tokens=turn_max_tokens,
+            trace_prefix="advisors_executor2",
+        )
+
+        tokens_local = adv_in + adv_out
+        tokens_cloud = (
+            initial_out["tokens_in"] + initial_out["tokens_out"]
+            + final_out["tokens_in"] + final_out["tokens_out"]
+        )
+        cost = initial_out["cost_usd"] + final_out["cost_usd"]
+        meta: Dict[str, Any] = {
+            "tokens_local": tokens_local,
+            "tokens_cloud": tokens_cloud,
+            "cost_usd": cost,
+            "turns": initial_out["turns"] + 1 + final_out["turns"],
+            "traces": {
+                "swe_mode": True,
+                "initial_summary": initial_out["final_summary"],
+                "initial_patch_chars": len(initial_out["patch"]),
+                "advisor_feedback": advisor_text,
+                "final_summary": final_out["final_summary"],
+                "final_patch_chars": len(final_out["patch"]),
+            },
+        }
+        return final_out["answer"], meta
 
 
 __all__ = ["AdvisorsAgent"]
