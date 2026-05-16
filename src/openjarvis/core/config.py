@@ -901,7 +901,7 @@ class AnalyticsConfig:
 
     enabled: bool = True
     host: str = "https://34.231.106.201.sslip.io"
-    key: str = "REPLACE_WITH_NEW_KEY_FROM_POSTHOG_SETTINGS"
+    key: str = "phc_ysKu72QaxzYNmDpHFcesD2ZZAe68zkdWJEKoYYkc5e3n"
     anon_id_path: str = str(DEFAULT_CONFIG_DIR / "anon_id")
     flush_interval_seconds: int = 30
     flush_at_size: int = 100
